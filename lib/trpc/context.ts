@@ -1,12 +1,12 @@
-import { db } from "@/lib/db";
+import { prisma } from "@/lib/db";
 
 export type TRPCContext = {
-  db: typeof db;
+  db: typeof prisma;
 };
 
 export async function createTRPCContext(): Promise<TRPCContext> {
   return {
-    db,
+    db: prisma,
   };
 }
 
