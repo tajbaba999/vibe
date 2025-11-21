@@ -11,7 +11,7 @@ export const inngestRouter = router({
     )
     .mutation(async ({ input }) => {
       await inngest.send({
-        name: "vibe/hello-world",
+        name: "",
         data: {
           name: input.name,
         },
