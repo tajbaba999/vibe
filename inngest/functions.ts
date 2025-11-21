@@ -1,6 +1,8 @@
 import { inngest } from "./client";
-import { gemini, createAgent } from "@inngest/agent-kit";
 import { prisma } from "../lib/db";
+import { Sandbox } from "@e2b/code-interpreter";
+import { getSandbox } from "./utils";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import {
   createCodeGenerationPrompt,
   extractJSON,
@@ -60,65 +62,38 @@ export const codeAgentFunction = inngest.createFunction(
           throw new Error("GEMINI_API_KEY missing. Add it in .env and restart.");
         }
 
-        console.log("🤖 Creating Gemini agent...");
-        const agent = createAgent({
-          name: "code-generator",
-          system: createCodeGenerationPrompt(userPrompt),
-          model: gemini({ model: "gemini-1.5-pro", apiKey }),
-        });
+        console.log("🤖 Calling Gemini API (Direct)...");
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-001" });
 
-        console.log("🤖 Calling Gemini API...");
-        const startTime = Date.now();
+        const systemPrompt = createCodeGenerationPrompt(userPrompt);
 
+        // Add timeout for the API call
+        const result = await Promise.race([
+          model.generateContent(systemPrompt),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Gemini API timeout after 120 seconds")), 120000)
+          )
+        ]) as any;
+
+        const response = await result.response;
+        const text = response.text();
+
+        console.log("✅ Gemini Response received");
+
+        let projectData;
         try {
-          // Add timeout to prevent hanging
-          const response: any = await Promise.race([
-            agent.run("Generate the project now."),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("Gemini API timeout after 120 seconds")), 120000)
-            )
-          ]);
-
-          const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-          console.log(`✅ Gemini Response received in ${duration}s`);
-
-          // Extract response text
-          let responseText = "";
-          if (typeof response === "string") {
-            responseText = response;
-          } else if (Array.isArray(response.output)) {
-            for (const msg of response.output) {
-              if (msg.role === "assistant" && "content" in msg && msg.content) {
-                if (typeof msg.content === "string") {
-                  responseText += msg.content;
-                } else if (Array.isArray(msg.content)) {
-                  responseText += msg.content.map((c: any) => c.text || "").join("");
-                }
-              }
-            }
-          } else {
-            responseText = JSON.stringify(response);
-          }
-
-          console.log("📄 Response length:", responseText.length);
-
-          // Extract and validate JSON
-          const projectData = extractJSON(responseText);
-
-          if (!validateGeneratedProject(projectData)) {
-            throw new Error("Invalid project structure from AI");
-          }
-
-          return projectData as GeneratedProject;
-        } catch (error: any) {
-          console.error("❌ Gemini API error:", error);
-          console.error("Error details:", {
-            message: error.message,
-            name: error.name,
-            stack: error.stack?.split('\n').slice(0, 3).join('\n'),
-          });
-          throw error;
+          projectData = extractJSON(text);
+        } catch (e) {
+          console.error("Failed to parse JSON from Gemini response", e);
+          throw new Error("Failed to parse JSON from Gemini response");
         }
+
+        if (!validateGeneratedProject(projectData)) {
+          throw new Error("Invalid project structure from AI");
+        }
+
+        return projectData as GeneratedProject;
       });
 
       console.log("📦 Generated project:", generatedProject.name);
@@ -139,7 +114,40 @@ export const codeAgentFunction = inngest.createFunction(
         return projectPath;
       });
 
-      // Step 4: Save file records to database
+      // Step 4: Create Sandbox
+      const sandboxId = await step.run("create-sandbox", async () => {
+        console.log("📦 Creating E2B sandbox...");
+        const sandbox = await Sandbox.create("vibe-nextjs-harsh-812");
+        console.log("✅ Sandbox created:", sandbox.sandboxId);
+        return sandbox.sandboxId;
+      });
+
+      // Step 5: Write files to Sandbox
+      await step.run("write-to-sandbox", async () => {
+        const sandbox = await getSandbox(sandboxId);
+        console.log("📝 Writing files to sandbox...");
+
+        for (const file of generatedProject.files) {
+          // Ensure directory exists for nested files
+          const dir = file.path.substring(0, file.path.lastIndexOf('/'));
+          if (dir) {
+            await sandbox.files.makeDir(dir);
+          }
+          await sandbox.files.write(file.path, file.content);
+        }
+        console.log("✅ Files written to sandbox");
+      });
+
+      // Step 6: Get Sandbox URL
+      const sandboxUrl = await step.run("get-sandbox-url", async () => {
+        const sandbox = await getSandbox(sandboxId);
+        const host = sandbox.getHost(3000);
+        const url = `https://${host}`;
+        console.log("🌐 Sandbox URL:", url);
+        return url;
+      });
+
+      // Step 7: Save file records to database
       await step.run("save-file-records", async () => {
         const fileRecords = generatedProject.files.map((file) => ({
           projectId: project.id,
@@ -155,7 +163,7 @@ export const codeAgentFunction = inngest.createFunction(
         console.log("💾 Saved", fileRecords.length, "file records to database");
       });
 
-      // Step 5: Update project status to completed
+      // Step 8: Update project status to completed
       await step.run("update-project-status", async () => {
         await prisma.project.update({
           where: { id: project.id },
@@ -177,7 +185,9 @@ export const codeAgentFunction = inngest.createFunction(
         description: generatedProject.description,
         filesCount: generatedProject.files.length,
         timestamp: new Date().toISOString(),
+        sandboxUrl,
       };
+
     } catch (err: any) {
       console.error("❌ Error:", err?.message || err);
 
